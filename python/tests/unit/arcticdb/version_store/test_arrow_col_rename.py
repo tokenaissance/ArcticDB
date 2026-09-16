@@ -11,10 +11,10 @@ import pandas as pd
 import pytest
 
 from arcticdb.exceptions import SchemaException, UserInputException
-from arcticdb.util.test import assert_frame_equal, assert_series_equal
+from arcticdb.options import OutputFormat
+from arcticdb.util.test import assert_pandas_equal
 
 
-@pytest.skip(reason="Monday 12844033169: Not implemented yet", allow_module_level=True)
 def assert_norm_meta_arrow_compatible(lib, sym):
     tsd = lib.version_store.read_descriptor(sym, lib._get_version_query(None)).timeseries_descriptor
     col_names = [field.name for field in tsd.as_stream_descriptor.fields()]
@@ -29,10 +29,22 @@ def assert_norm_meta_arrow_compatible(lib, sym):
         assert not norm_meta.series.has_synthetic_columns
         common = norm_meta.series.common
         assert common.has_name
-        assert common.name == col_names[-1]
+        # The on-disk field name can differ from the declared pandas-level name for values like "" that get a
+        # special on-disk placeholder key for disambiguation purposes (see col_names below)
+        name_col_entry = common.col_names.get(col_names[-1])
+        if name_col_entry.is_empty:
+            assert common.name == ""
+        else:
+            assert common.name == col_names[-1]
     else:
         assert False
-    assert not len(common.col_names)
+    for col_name, col_meta in common.col_names.items():
+        assert not col_meta.is_int
+        assert not col_meta.is_none
+        if col_meta.is_empty:
+            assert col_name.startswith("__empty__")
+        else:
+            assert col_name == col_meta.original_name
     if common.WhichOneof("index_type") == "index":
         index = common.index
         assert not index.fake_name
@@ -44,6 +56,22 @@ def assert_norm_meta_arrow_compatible(lib, sym):
         assert not index.is_int
         assert not len(index.fake_field_pos)
         assert index.name == col_names[0]
+        for idx in range(1, index.field_count + 1):
+            assert col_names[idx].startswith("__idx__")
+
+
+def generic_rename_columns_arrow_compat_test(lib, sym, method_arg=None):
+    before = lib.read(sym, output_format=OutputFormat.PYARROW).data
+    lib.rename_columns_arrow_compat(sym, method_arg)
+    assert_norm_meta_arrow_compatible(lib, sym)
+    after = lib.read(sym, output_format=OutputFormat.PYARROW).data
+    if method_arg is None:
+        assert before.equals(after)
+    elif isinstance(method_arg, str):
+        assert after.column_names[0] == method_arg
+    elif isinstance(method_arg, list):
+        for idx, index_name in enumerate(method_arg):
+            assert after.column_names[idx] == index_name
 
 
 @pytest.mark.parametrize("method_arg", [5, [], [5, "hello"]])
@@ -54,24 +82,23 @@ def test_bad_arguments(in_memory_version_store, method_arg):
         lib.rename_columns_arrow_compat(sym, method_arg)
 
 
+@pytest.mark.parametrize("dynamic_schema", [False, True])
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
 # Empty string names have special norm metadata in ArcticDB, but are allowed by Arrow without modification
 # Current sparrow version doesn't support empty string column names though, see test_write_empty_column_name_fails
 @pytest.mark.parametrize("col_name", [None, "", 10])
-def test_arrow_col_rename_basic(in_memory_version_store, object_type, col_name):
-    lib = in_memory_version_store
+def test_arrow_col_rename_basic(in_memory_store_factory, dynamic_schema, object_type, col_name):
+    lib = in_memory_store_factory(dynamic_schema=dynamic_schema)
     sym = "test_arrow_col_rename_basic"
     input = pd.DataFrame({col_name: [0]}) if object_type == "DataFrame" else pd.Series([0], name=col_name)
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
-    expected = pd.DataFrame({str(col_name): [0]}) if object_type == "DataFrame" else pd.Series([0], name=str(col_name))
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    if object_type == "DataFrame":
+        expected = pd.DataFrame({str(col_name): [0]})
+    else:
+        expected = pd.Series([0], name="" if col_name is None else str(col_name))
+    assert_pandas_equal(received, expected)
 
 
 def test_arrow_col_rename_duplicates(in_memory_version_store):
@@ -79,7 +106,7 @@ def test_arrow_col_rename_duplicates(in_memory_version_store):
     sym = "test_arrow_col_rename_duplicates"
     input = pd.DataFrame(np.zeros((1, 12)), columns=["col", "col", "col", "", "", "", None, None, "None", 10, "10", 10])
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
     # Note that None and int column names are stringified prior to deduplication from left-to-right, hence the order
     # "None", "_None_", "__None__", "10", "_10_", "__10__" in the output, even though some columns were strings already
@@ -87,36 +114,20 @@ def test_arrow_col_rename_duplicates(in_memory_version_store):
         np.zeros((1, 12)),
         columns=["col", "_col_", "__col__", "", "__", "____", "None", "_None_", "__None__", "10", "_10_", "__10__"],
     )
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    assert_pandas_equal(received, expected)
 
 
-@pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
-def test_arrow_col_rename_synthetic_columns(in_memory_version_store, object_type):
+# Unnamed Series also have synthetic columns on disk, but are renamed to "" rather than the positional "0" that users
+# would never have seen previously, see test_arrow_col_rename_basic
+def test_arrow_col_rename_synthetic_columns(in_memory_version_store):
     lib = in_memory_version_store
     sym = "test_arrow_col_rename_synthetic_columns"
-    input = pd.DataFrame(np.zeros((1, 10))) if object_type == "DataFrame" else pd.Series([0])
+    input = pd.DataFrame(np.zeros((1, 10)))
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
-    expected = (
-        pd.DataFrame(
-            np.zeros((1, 10)),
-            columns=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
-        )
-        if object_type == "DataFrame"
-        else pd.Series([0], name="0")
-    )
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    expected = pd.DataFrame(np.zeros((1, 10)), columns=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
@@ -126,20 +137,15 @@ def test_single_index_auto_rename_int_no_clash(in_memory_version_store, object_t
     input = (
         pd.DataFrame({"col": [0]}, index=[pd.Timestamp(0)])
         if object_type == "DataFrame"
-        else pd.Series([0], index=[pd.Timestamp(0)])
+        else pd.Series([0], index=[pd.Timestamp(0)], name="col")
     )
     input.index.name = 10
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
     expected = input
     expected.index.name = "10"
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
@@ -153,16 +159,17 @@ def test_single_index_auto_rename_int_one_clash(in_memory_version_store, object_
     )
     input.index.name = 10
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
-    expected = input
-    expected.index.name = "_10_"
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
+    # The index's real name takes the unwrapped slot unconditionally, since it is processed before the data
+    # columns; the data column is processed afterwards and wrapped to avoid the resulting clash
+    expected = (
+        pd.DataFrame({"_10_": [0]}, index=[pd.Timestamp(0)])
+        if object_type == "DataFrame"
+        else pd.Series([0], index=[pd.Timestamp(0)], name="_10_")
     )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    expected.index.name = "10"
+    assert_pandas_equal(received, expected)
 
 
 def test_single_index_auto_rename_int_multiple_clashes(in_memory_version_store):
@@ -171,16 +178,12 @@ def test_single_index_auto_rename_int_multiple_clashes(in_memory_version_store):
     input = pd.DataFrame({"10": [0], 10: [1]}, index=[pd.Timestamp(0)])
     input.index.name = 10
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
-    expected = pd.DataFrame({"10": [0], "_10_": [1]}, index=[pd.Timestamp(0)])
-    expected.index.name = "__10__"
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    # The index's real name takes the unwrapped slot "10" unconditionally; both data columns then wrap to avoid it
+    expected = pd.DataFrame({"_10_": [0], "__10__": [1]}, index=[pd.Timestamp(0)])
+    expected.index.name = "10"
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
@@ -190,24 +193,19 @@ def test_single_index_auto_rename_nameless_no_clash(in_memory_version_store, obj
     input = (
         pd.DataFrame({"col": [0]}, index=[pd.Timestamp(0)])
         if object_type == "DataFrame"
-        else pd.Series([0], index=[pd.Timestamp(0)])
+        else pd.Series([0], index=[pd.Timestamp(0)], name="col")
     )
     assert input.index.name is None
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
     expected = input
-    expected.index.name = "index"
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    expected.index.name = "__index__"
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
-@pytest.mark.parametrize("col_name", [None, "", 10, "index", "hello"])
+@pytest.mark.parametrize("col_name", [None, "", 10, "__index__", "hello"])
 def test_single_index_auto_rename_index_and_col_name_same(in_memory_version_store, object_type, col_name):
     lib = in_memory_version_store
     sym = "test_single_index_auto_rename_index_and_col_name_same"
@@ -218,20 +216,24 @@ def test_single_index_auto_rename_index_and_col_name_same(in_memory_version_stor
     )
     input.index.name = col_name
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
+    if col_name is None:
+        index_name = "__index__"
+        # An unnamed Series is renamed to "" (the polars convention for unnamed Series) rather than "None"
+        col_display_name = "" if object_type == "Series" else "None"
+    else:
+        # The index's real name takes the unwrapped slot unconditionally, since it is processed before the data
+        # columns; the data column is processed afterwards and wrapped to avoid the resulting clash
+        index_name = str(col_name)
+        col_display_name = f"_{col_name}_"
     expected = (
-        pd.DataFrame({str(col_name): [0]}, index=[pd.Timestamp(0)])
+        pd.DataFrame({col_display_name: [0]}, index=[pd.Timestamp(0)])
         if object_type == "DataFrame"
-        else pd.Series([0], index=[pd.Timestamp(0)], name=str(col_name))
+        else pd.Series([0], index=[pd.Timestamp(0)], name=col_display_name)
     )
-    expected.index.name = f"_{col_name}_"
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    expected.index.name = index_name
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
@@ -239,36 +241,30 @@ def test_single_index_auto_rename_nameless_one_clash(in_memory_version_store, ob
     lib = in_memory_version_store
     sym = "test_single_index_auto_rename_nameless_one_clash"
     input = (
-        pd.DataFrame({"index": [0]}, index=[pd.Timestamp(0)])
+        pd.DataFrame({"__index__": [0]}, index=[pd.Timestamp(0)])
         if object_type == "DataFrame"
-        else pd.Series([0], index=[pd.Timestamp(0)], name="index")
+        else pd.Series([0], index=[pd.Timestamp(0)], name="__index__")
     )
     assert input.index.name is None
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
     expected = input
-    expected.index.name = "_index_"
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    expected.index.name = "___index___"
+    assert_pandas_equal(received, expected)
 
 
 def test_single_index_auto_rename_nameless_multiple_clashes(in_memory_version_store):
     lib = in_memory_version_store
     sym = "test_single_index_auto_rename_nameless_multiple_clashes"
-    input = pd.DataFrame(np.zeros((1, 2)), columns=["index", "index"], index=[pd.Timestamp(0)])
+    input = pd.DataFrame(np.zeros((1, 2)), columns=["__index__", "__index__"], index=[pd.Timestamp(0)])
     assert input.index.name is None
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
-    expected = pd.DataFrame(np.zeros((1, 2)), columns=["index", "_index_"], index=[pd.Timestamp(0)])
-    expected.index.name = "__index__"
-    assert_frame_equal(received, expected)
-    assert_norm_meta_arrow_compatible(lib, sym)
+    expected = pd.DataFrame(np.zeros((1, 2)), columns=["__index__", "____index____"], index=[pd.Timestamp(0)])
+    expected.index.name = "___index___"
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
@@ -283,20 +279,15 @@ def test_single_index_explicit_rename_nameless_no_clash(
     input = (
         pd.DataFrame({"col": [0]}, index=[pd.Timestamp(0)])
         if object_type == "DataFrame"
-        else pd.Series([0], index=[pd.Timestamp(0)])
+        else pd.Series([0], index=[pd.Timestamp(0)], name="col")
     )
     input.index.name = input_index_name
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym, method_arg)
+    generic_rename_columns_arrow_compat_test(lib, sym, method_arg)
     received = lib.read(sym).data
     expected = input
     expected.index.name = "ts"
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
@@ -335,20 +326,15 @@ def test_multi_index_auto_rename_int_no_clash(in_memory_version_store, object_ty
     index = pd.MultiIndex.from_arrays([[0], [1]], names=[10, "level1"])
     input = pd.DataFrame({"col": [0]}, index=index) if object_type == "DataFrame" else pd.Series([0], index=index)
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
     expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=["10", "level1"])
     expected = (
         pd.DataFrame({"col": [0]}, index=expected_index)
         if object_type == "DataFrame"
-        else pd.Series([0], index=expected_index)
+        else pd.Series([0], index=expected_index, name="")
     )
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
@@ -360,20 +346,17 @@ def test_multi_index_auto_rename_int_one_clash(in_memory_version_store, object_t
         pd.DataFrame({"10": [0]}, index=index) if object_type == "DataFrame" else pd.Series([0], index=index, name="10")
     )
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
-    expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=["_10_", "level1"])
+    # Multi-index level 0's real name takes the unwrapped slot unconditionally, since it is processed before the
+    # data columns; the data column is processed afterwards and wrapped to avoid the resulting clash
+    expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=["10", "level1"])
     expected = (
-        pd.DataFrame({"col": [0]}, index=expected_index)
+        pd.DataFrame({"_10_": [0]}, index=expected_index)
         if object_type == "DataFrame"
-        else pd.Series([0], index=expected_index)
+        else pd.Series([0], index=expected_index, name="_10_")
     )
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    assert_pandas_equal(received, expected)
 
 
 def test_multi_index_auto_rename_int_multiple_clashes(in_memory_version_store):
@@ -382,16 +365,13 @@ def test_multi_index_auto_rename_int_multiple_clashes(in_memory_version_store):
     index = pd.MultiIndex.from_arrays([[0], [1]], names=[10, 10])
     input = pd.DataFrame({"10": [0], 10: [1]}, index=index)
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
-    expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=["__10__", "___10___"])
-    expected = pd.DataFrame({"10": [0], "_10_": [1]}, index=expected_index)
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    # Multi-index level 0's real name takes the unwrapped slot "10" unconditionally; level 1's real name is then
+    # wrapped once to avoid that clash; both data columns are processed last and wrap further still
+    expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=["10", "_10_"])
+    expected = pd.DataFrame({"__10__": [0], "___10___": [1]}, index=expected_index)
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
@@ -401,88 +381,85 @@ def test_multi_index_auto_rename_nameless_no_clash(in_memory_version_store, obje
     index = pd.MultiIndex.from_arrays([[0], [1]])
     input = pd.DataFrame({"col": [0]}, index=index) if object_type == "DataFrame" else pd.Series([0], index=index)
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
-    expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=["index_level_0", "index_level_1"])
+    expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=["__index_level_0__", "__index_level_1__"])
     expected = (
         pd.DataFrame({"col": [0]}, index=expected_index)
         if object_type == "DataFrame"
-        else pd.Series([0], index=expected_index)
+        else pd.Series([0], index=expected_index, name="")
     )
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
 @pytest.mark.parametrize(
-    "input_names,output_names",
+    "input_names,output_names,col_name",
     [
-        pytest.param([None, None], ["_index_level_0_", "_index_level_1_"]),
-        pytest.param([None, "index_level_0"], ["__index_level_0__", "_index_level_0_"]),
-        pytest.param(["index_level_1", None], ["index_level_1", "_index_level_0_"]),
+        # No clash between the index candidate name and the data column's real name "__index_level_0__" here, so
+        # the data column is left untouched by the rename loop
+        pytest.param([None, None], ["___index_level_0___", "__index_level_1__"], "__index_level_0__"),
+        pytest.param(
+            [None, "__index_level_0__"], ["___index_level_0___", "__index_level_0__"], "____index_level_0____"
+        ),
+        pytest.param(["__index_level_1__", None], ["__index_level_1__", "___index_level_1___"], "__index_level_0__"),
     ],
 )
-def test_multi_index_auto_rename_nameless_clashes(in_memory_version_store, object_type, input_names, output_names):
+def test_multi_index_auto_rename_nameless_clashes(
+    in_memory_version_store, object_type, input_names, output_names, col_name
+):
     lib = in_memory_version_store
     sym = "test_multi_index_auto_rename_nameless_clashes"
     index = pd.MultiIndex.from_arrays([[0], [1]], names=input_names)
     input = (
-        pd.DataFrame({"index_level_0": [0]}, index=index)
+        pd.DataFrame({"__index_level_0__": [0]}, index=index)
         if object_type == "DataFrame"
-        else pd.Series([0], index=index, name="index_level_0")
+        else pd.Series([0], index=index, name="__index_level_0__")
     )
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym)
+    generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
     expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=output_names)
     expected = (
-        pd.DataFrame({"index_level_0": [0]}, index=expected_index)
+        pd.DataFrame({col_name: [0]}, index=expected_index)
         if object_type == "DataFrame"
-        else pd.Series([0], index=expected_index, name="index_level_0")
+        else pd.Series([0], index=expected_index, name=col_name)
     )
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
 @pytest.mark.parametrize("input_names", [[None, None], ["level0", "level1"]])
 def test_multi_index_explicit_rename_no_clash(in_memory_version_store, object_type, input_names):
     lib = in_memory_version_store
-    sym = "test_multi_index_explicit_rename_nameless_no_clash"
+    sym = "test_multi_index_explicit_rename_no_clash"
     index = pd.MultiIndex.from_arrays([[0], [1]], names=input_names)
     input = pd.DataFrame({"col": [0]}, index=index) if object_type == "DataFrame" else pd.Series([0], index=index)
     lib.write(sym, input)
-    lib.rename_columns_arrow_compat(sym, ["my_level_0", "my_level_1"])
+    generic_rename_columns_arrow_compat_test(lib, sym, ["my_level_0", "my_level_1"])
     received = lib.read(sym).data
     expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=["my_level_0", "my_level_1"])
     expected = (
         pd.DataFrame({"col": [0]}, index=expected_index)
         if object_type == "DataFrame"
-        else pd.Series([0], index=expected_index)
+        else pd.Series([0], index=expected_index, name="")
     )
-    (
-        assert_frame_equal(received, expected)
-        if isinstance(expected, pd.DataFrame)
-        else assert_series_equal(received, expected)
-    )
-    assert_norm_meta_arrow_compatible(lib, sym)
+    assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
 @pytest.mark.parametrize("method_arg", [["col", "level1"], ["level0", "col"]])
 def test_multi_index_explicit_rename_clash(in_memory_version_store, object_type, method_arg):
     lib = in_memory_version_store
-    sym = "test_multi_index_explicit_rename_no_clash"
+    sym = "test_multi_index_explicit_rename_clash"
     index = pd.MultiIndex.from_arrays([[0], [1]])
-    input = pd.DataFrame({"col": [0]}, index=index) if object_type == "DataFrame" else pd.Series([0], index=index)
+    # The Series must be explicitly named "col", otherwise it would get a synthetic "0" data column name instead,
+    # which would not clash with either method_arg below
+    input = (
+        pd.DataFrame({"col": [0]}, index=index)
+        if object_type == "DataFrame"
+        else pd.Series([0], index=index, name="col")
+    )
     lib.write(sym, input)
     with pytest.raises(SchemaException):
         lib.rename_columns_arrow_compat(sym, method_arg)
