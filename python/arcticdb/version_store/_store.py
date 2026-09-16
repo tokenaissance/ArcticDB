@@ -2546,43 +2546,29 @@ class NativeVersionStore:
         read_result = self._read_dataframe(symbol, version_query, read_query, read_options)
         return self._post_process_dataframe(read_result, read_query, read_options, output_format, implement_read_index)
 
+    # TODO: Consider returning a structure that states what changed?
+    # TODO: Add prune_previous argument and test it, including reading old version has original index/column names
     def rename_columns_arrow_compat(self, symbol: str, method_arg: Optional[Union[str, List[str]]] = None) -> None:
-        """
-        Rewrites `symbol` in place so that its column and index names are exactly the names that would be produced
-        by reading it in Arrow format (see the Pandas->Arrow denormalization logic), so that subsequent Pandas and
-        Arrow format reads return identically-labelled data.
-
-        Parameters
-        ----------
-        method_arg : `Optional[Union[str, List[str]]]`, default=None
-            If None, index names are chosen automatically, following the same rules as Arrow denormalization.
-            Otherwise, explicitly overrides the index name(s) (a single name for a single index, or a list with one
-            name per level for a MultiIndex). Data column names are still chosen automatically in this case.
-
-        Raises
-        ------
-        UserInputException
-            If method_arg is not None/str/List[str], or if it does not contain the correct number of index names.
-        SchemaException
-            If an explicitly provided index name clashes with another index or column name.
-        """
         explicit_index_names = None
-        if method_arg is not None:
-            if isinstance(method_arg, str):
-                explicit_index_names = [method_arg]
-            elif (
-                isinstance(method_arg, list)
-                and len(method_arg) > 0
-                and all(isinstance(elem, str) for elem in method_arg)
-            ):
-                explicit_index_names = list(method_arg)
-            else:
-                raise UserInputException(f"method_arg must be a non-empty str or list of str, received {method_arg!r}")
+        if isinstance(method_arg, str):
+            explicit_index_names = [method_arg]
+        elif isinstance(method_arg, list) and len(method_arg) > 0 and all(isinstance(elem, str) for elem in method_arg):
+            explicit_index_names = method_arg
+        elif method_arg is not None:
+            raise UserInputException(f"method_arg must be a non-empty str or list of str, received {method_arg!r}")
 
         tsd = self.version_store.read_descriptor(symbol, self._get_version_query(None)).timeseries_descriptor
         norm_meta = tsd.normalization
         input_type = norm_meta.WhichOneof("input_type")
-        common = norm_meta.df.common if input_type == "df" else norm_meta.series.common
+        if input_type == "experimental_arrow":
+            log.info("Data was written as Arrow, no compat renaming required")
+            return
+        elif input_type not in ["df", "series"]:
+            raise UserInputException(
+                f"rename_columns_arrow_compat only operates on Pandas-like data, called on {input_type}"
+            )
+        else:
+            common = getattr(norm_meta, input_type).common
         if common.WhichOneof("index_type") == "index":
             num_index_columns = 1 if common.index.is_physically_stored else 0
         else:
@@ -2594,7 +2580,7 @@ class NativeVersionStore:
                 f"names were provided"
             )
 
-        arrow_column_names = self.read(symbol, output_format=OutputFormat.PYARROW).data.column_names
+        arrow_column_names = self.head(symbol, n=0, output_format=OutputFormat.PYARROW).data.column_names
         auto_index_names = arrow_column_names[:num_index_columns]
         data_column_names = arrow_column_names[num_index_columns:]
         index_names = explicit_index_names if explicit_index_names is not None else auto_index_names
@@ -2606,7 +2592,8 @@ class NativeVersionStore:
                     f"Requested index name(s) {index_names} clash with data column names {data_column_names}"
                 )
 
-        data = self.read(symbol).data
+        before = self.read(symbol, output_format=OutputFormat.PANDAS)
+        data = before.data
         if isinstance(data, pd.Series):
             data.name = data_column_names[0]
         else:
@@ -2616,7 +2603,7 @@ class NativeVersionStore:
         elif num_index_columns > 1:
             data.index = data.index.set_names(index_names)
 
-        self.write(symbol, data)
+        self.write(symbol, data, metadata=before.metadata)
 
     def head(
         self,

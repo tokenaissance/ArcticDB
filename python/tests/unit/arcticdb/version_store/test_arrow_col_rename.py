@@ -8,9 +8,10 @@ As of the Change Date specified in that file, in accordance with the Business So
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pytest
 
-from arcticdb.exceptions import SchemaException, UserInputException
+from arcticdb.exceptions import NoSuchVersionException, SchemaException, UserInputException
 from arcticdb.options import OutputFormat
 from arcticdb.util.test import assert_pandas_equal
 
@@ -36,13 +37,16 @@ def assert_norm_meta_arrow_compatible(lib, sym):
             assert common.name == ""
         else:
             assert common.name == col_names[-1]
+    empty_col_count = 0
     for col_name, col_meta in common.col_names.items():
         assert not col_meta.is_int
         assert not col_meta.is_none
         if col_meta.is_empty:
+            empty_col_count += 1
             assert col_name.startswith("__empty__")
         else:
             assert col_name == col_meta.original_name
+    assert empty_col_count <= 1
     if common.WhichOneof("index_type") == "index":
         index = common.index
         assert not index.fake_name
@@ -59,16 +63,27 @@ def assert_norm_meta_arrow_compatible(lib, sym):
 
 
 def generic_rename_columns_arrow_compat_test(lib, sym, method_arg=None):
-    before = lib.read(sym, output_format=OutputFormat.PYARROW).data
+    before = lib.read(sym, output_format=OutputFormat.PYARROW)
+    before_data, before_metadata, before_version = before.data, before.metadata, before.version
     lib.rename_columns_arrow_compat(sym, method_arg)
     assert_norm_meta_arrow_compatible(lib, sym)
-    after = lib.read(sym, output_format=OutputFormat.PYARROW).data
+    after = lib.read(sym, output_format=OutputFormat.PYARROW)
+    after_data, after_metadata, after_version = after.data, after.metadata, after.version
+    # TODO: Add tests that no new version is created if it would be a no-op
+    assert after_version == before_version + 1
+    assert before_metadata == after_metadata
     if isinstance(method_arg, str):
-        before = before.set_column(0, method_arg, before.column(0))
+        before_data = before_data.set_column(0, method_arg, before_data.column(0))
     elif isinstance(method_arg, list):
         for idx, index_name in enumerate(method_arg):
-            before = before.set_column(idx, index_name, before.column(idx))
-    assert before.equals(after)
+            before_data = before_data.set_column(idx, index_name, before_data.column(idx))
+    assert before_data.equals(after_data)
+    # Idempotent
+    # TODO: Assert this doesn't increment the version number
+    after_pandas = lib.read(sym, output_format=OutputFormat.PANDAS).data
+    lib.rename_columns_arrow_compat(sym, method_arg)
+    after_after_pandas = lib.read(sym, output_format=OutputFormat.PANDAS).data
+    assert_pandas_equal(after_after_pandas, after_pandas)
 
 
 @pytest.mark.parametrize("method_arg", [5, [], [5, "hello"]])
@@ -88,7 +103,7 @@ def test_arrow_col_rename_basic(in_memory_store_factory, dynamic_schema, object_
     lib = in_memory_store_factory(dynamic_schema=dynamic_schema)
     sym = "test_arrow_col_rename_basic"
     input = pd.DataFrame({col_name: [0]}) if object_type == "DataFrame" else pd.Series([0], name=col_name)
-    lib.write(sym, input)
+    lib.write(sym, input, metadata="hello")
     generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
     if object_type == "DataFrame":
@@ -474,3 +489,43 @@ def test_multi_index_incorrect_index_name_count(in_memory_version_store, object_
     lib.write(sym, input)
     with pytest.raises(UserInputException):
         lib.rename_columns_arrow_compat(sym, method_arg)
+
+
+def test_noop_with_arrow_written_data(in_memory_version_store_arrow):
+    lib = in_memory_version_store_arrow
+    sym = "test_noop_with_arrow_written_data"
+    table = pa.table({"col": pa.array([0], pa.int64())})
+    lib.write(sym, table)
+    lib.rename_columns_arrow_compat(sym)
+    assert lib.read_metadata(sym).version == 0
+
+
+def test_exception_with_pickled_data(in_memory_version_store):
+    lib = in_memory_version_store
+    sym = "test_exception_with_pickled_data"
+    lib.write(sym, "hello")
+    assert lib.is_symbol_pickled(sym)
+    with pytest.raises(UserInputException):
+        lib.rename_columns_arrow_compat(sym)
+
+
+def test_exception_with_numpy_array(in_memory_version_store):
+    lib = in_memory_version_store
+    sym = "test_exception_with_numpy_array"
+    lib.write(sym, np.arange(1))
+    assert not lib.is_symbol_pickled(sym)
+    with pytest.raises(UserInputException):
+        lib.rename_columns_arrow_compat(sym)
+
+
+def test_exception_with_non_existent_symbol(in_memory_version_store):
+    lib = in_memory_version_store
+    sym = "test_exception_with_numpy_array"
+    with pytest.raises(NoSuchVersionException):
+        lib.rename_columns_arrow_compat(sym)
+
+
+# TODO: Add tests that the flow read as arrow, rename_columns_arrow_compat, append something with same schema as
+#  original read arrow data should work
+
+# TODO: Add tests that column filtering and query builder operations work as expected after the rename
