@@ -2570,7 +2570,9 @@ class NativeVersionStore:
         else:
             common = getattr(norm_meta, input_type).common
         if common.WhichOneof("index_type") == "index":
-            num_index_columns = 1 if common.index.is_physically_stored else 0
+            # Empty DatetimeIndex frames are not marked as physically stored, but do have an index column, and are
+            # distinguishable from RangeIndex frames by having step == 0. This mirrors ArrowTableNormalizer.denormalize
+            num_index_columns = 1 if common.index.is_physically_stored or not common.index.step else 0
         else:
             num_index_columns = common.multi_index.field_count + 1
 

@@ -41,6 +41,9 @@ def assert_norm_meta_arrow_compatible(lib, sym):
     for col_name, col_meta in common.col_names.items():
         assert not col_meta.is_int
         assert not col_meta.is_none
+        # Ideally we would store empty string column names as "" with col_meta.is_empty == False. However, there are
+        # C++ level checks (e.g. SegmentInMemoryImpl::column_index) that would prevent this data being read by older
+        # clients, which is not a problem with 5 -> "5" or None -> "None".
         if col_meta.is_empty:
             empty_col_count += 1
             assert col_name.startswith("__empty__")
@@ -211,6 +214,27 @@ def test_single_index_auto_rename_nameless_no_clash(in_memory_version_store, obj
     received = lib.read(sym).data
     expected = input
     expected.index.name = "__index__"
+    assert_pandas_equal(received, expected)
+
+
+# Empty DatetimeIndex frames are not marked as having a physically stored index, but still have an index column
+@pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
+@pytest.mark.parametrize("index_name", [None, "ts"])
+def test_single_index_auto_rename_empty_frame(in_memory_version_store, object_type, index_name):
+    lib = in_memory_version_store
+    sym = "test_single_index_auto_rename_empty_frame"
+    index = pd.DatetimeIndex([], name=index_name)
+    values = np.array([], dtype=np.int64)
+    input = (
+        pd.DataFrame({"col": values}, index=index)
+        if object_type == "DataFrame"
+        else pd.Series(values, index=index, name="col")
+    )
+    lib.write(sym, input)
+    generic_rename_columns_arrow_compat_test(lib, sym)
+    received = lib.read(sym).data
+    expected = input
+    expected.index.name = "__index__" if index_name is None else index_name
     assert_pandas_equal(received, expected)
 
 
