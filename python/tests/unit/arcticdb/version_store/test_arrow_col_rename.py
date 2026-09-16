@@ -43,7 +43,8 @@ def assert_norm_meta_arrow_compatible(lib, sym):
         assert not col_meta.is_none
         # Ideally we would store empty string column names as "" with col_meta.is_empty == False. However, there are
         # C++ level checks (e.g. SegmentInMemoryImpl::column_index) that would prevent this data being read by older
-        # clients, which is not a problem with 5 -> "5" or None -> "None".
+        # clients, which is not a problem with 5 -> "5" or None -> "None". Additionally, sparrow does not support
+        # empty strings as column names (checked 16/9/26) due to an assertion in record_batch::check_consistency().
         if col_meta.is_empty:
             empty_col_count += 1
             assert col_name.startswith("__empty__")
