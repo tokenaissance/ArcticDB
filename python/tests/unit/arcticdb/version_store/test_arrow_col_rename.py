@@ -36,8 +36,6 @@ def assert_norm_meta_arrow_compatible(lib, sym):
             assert common.name == ""
         else:
             assert common.name == col_names[-1]
-    else:
-        assert False
     for col_name, col_meta in common.col_names.items():
         assert not col_meta.is_int
         assert not col_meta.is_none
@@ -65,13 +63,12 @@ def generic_rename_columns_arrow_compat_test(lib, sym, method_arg=None):
     lib.rename_columns_arrow_compat(sym, method_arg)
     assert_norm_meta_arrow_compatible(lib, sym)
     after = lib.read(sym, output_format=OutputFormat.PYARROW).data
-    if method_arg is None:
-        assert before.equals(after)
-    elif isinstance(method_arg, str):
-        assert after.column_names[0] == method_arg
+    if isinstance(method_arg, str):
+        before = before.set_column(0, method_arg, before.column(0))
     elif isinstance(method_arg, list):
         for idx, index_name in enumerate(method_arg):
-            assert after.column_names[idx] == index_name
+            before = before.set_column(idx, index_name, before.column(idx))
+    assert before.equals(after)
 
 
 @pytest.mark.parametrize("method_arg", [5, [], [5, "hello"]])
@@ -82,10 +79,10 @@ def test_bad_arguments(in_memory_version_store, method_arg):
         lib.rename_columns_arrow_compat(sym, method_arg)
 
 
+# Dynamic schema uses different name-mangling (appends _0 instead of _n where n is the column index) as column index is
+# not stable on append/update
 @pytest.mark.parametrize("dynamic_schema", [False, True])
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
-# Empty string names have special norm metadata in ArcticDB, but are allowed by Arrow without modification
-# Current sparrow version doesn't support empty string column names though, see test_write_empty_column_name_fails
 @pytest.mark.parametrize("col_name", [None, "", 10])
 def test_arrow_col_rename_basic(in_memory_store_factory, dynamic_schema, object_type, col_name):
     lib = in_memory_store_factory(dynamic_schema=dynamic_schema)
@@ -117,8 +114,6 @@ def test_arrow_col_rename_duplicates(in_memory_version_store):
     assert_pandas_equal(received, expected)
 
 
-# Unnamed Series also have synthetic columns on disk, but are renamed to "" rather than the positional "0" that users
-# would never have seen previously, see test_arrow_col_rename_basic
 def test_arrow_col_rename_synthetic_columns(in_memory_version_store):
     lib = in_memory_version_store
     sym = "test_arrow_col_rename_synthetic_columns"
@@ -348,8 +343,6 @@ def test_multi_index_auto_rename_int_one_clash(in_memory_version_store, object_t
     lib.write(sym, input)
     generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
-    # Multi-index level 0's real name takes the unwrapped slot unconditionally, since it is processed before the
-    # data columns; the data column is processed afterwards and wrapped to avoid the resulting clash
     expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=["10", "level1"])
     expected = (
         pd.DataFrame({"_10_": [0]}, index=expected_index)
@@ -367,8 +360,6 @@ def test_multi_index_auto_rename_int_multiple_clashes(in_memory_version_store):
     lib.write(sym, input)
     generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
-    # Multi-index level 0's real name takes the unwrapped slot "10" unconditionally; level 1's real name is then
-    # wrapped once to avoid that clash; both data columns are processed last and wrap further still
     expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=["10", "_10_"])
     expected = pd.DataFrame({"__10__": [0], "___10___": [1]}, index=expected_index)
     assert_pandas_equal(received, expected)
@@ -379,7 +370,11 @@ def test_multi_index_auto_rename_nameless_no_clash(in_memory_version_store, obje
     lib = in_memory_version_store
     sym = "test_multi_index_auto_rename_nameless_no_clash"
     index = pd.MultiIndex.from_arrays([[0], [1]])
-    input = pd.DataFrame({"col": [0]}, index=index) if object_type == "DataFrame" else pd.Series([0], index=index)
+    input = (
+        pd.DataFrame({"col": [0]}, index=index)
+        if object_type == "DataFrame"
+        else pd.Series([0], index=index, name="col")
+    )
     lib.write(sym, input)
     generic_rename_columns_arrow_compat_test(lib, sym)
     received = lib.read(sym).data
@@ -387,17 +382,15 @@ def test_multi_index_auto_rename_nameless_no_clash(in_memory_version_store, obje
     expected = (
         pd.DataFrame({"col": [0]}, index=expected_index)
         if object_type == "DataFrame"
-        else pd.Series([0], index=expected_index, name="")
+        else pd.Series([0], index=expected_index, name="col")
     )
     assert_pandas_equal(received, expected)
 
 
 @pytest.mark.parametrize("object_type", ["DataFrame", "Series"])
 @pytest.mark.parametrize(
-    "input_names,output_names,col_name",
+    "input_names,output_names,output_col_name",
     [
-        # No clash between the index candidate name and the data column's real name "__index_level_0__" here, so
-        # the data column is left untouched by the rename loop
         pytest.param([None, None], ["___index_level_0___", "__index_level_1__"], "__index_level_0__"),
         pytest.param(
             [None, "__index_level_0__"], ["___index_level_0___", "__index_level_0__"], "____index_level_0____"
@@ -406,7 +399,7 @@ def test_multi_index_auto_rename_nameless_no_clash(in_memory_version_store, obje
     ],
 )
 def test_multi_index_auto_rename_nameless_clashes(
-    in_memory_version_store, object_type, input_names, output_names, col_name
+    in_memory_version_store, object_type, input_names, output_names, output_col_name
 ):
     lib = in_memory_version_store
     sym = "test_multi_index_auto_rename_nameless_clashes"
@@ -421,9 +414,9 @@ def test_multi_index_auto_rename_nameless_clashes(
     received = lib.read(sym).data
     expected_index = pd.MultiIndex.from_arrays([[0], [1]], names=output_names)
     expected = (
-        pd.DataFrame({col_name: [0]}, index=expected_index)
+        pd.DataFrame({output_col_name: [0]}, index=expected_index)
         if object_type == "DataFrame"
-        else pd.Series([0], index=expected_index, name=col_name)
+        else pd.Series([0], index=expected_index, name=output_col_name)
     )
     assert_pandas_equal(received, expected)
 
@@ -434,7 +427,11 @@ def test_multi_index_explicit_rename_no_clash(in_memory_version_store, object_ty
     lib = in_memory_version_store
     sym = "test_multi_index_explicit_rename_no_clash"
     index = pd.MultiIndex.from_arrays([[0], [1]], names=input_names)
-    input = pd.DataFrame({"col": [0]}, index=index) if object_type == "DataFrame" else pd.Series([0], index=index)
+    input = (
+        pd.DataFrame({"col": [0]}, index=index)
+        if object_type == "DataFrame"
+        else pd.Series([0], index=index, name="col")
+    )
     lib.write(sym, input)
     generic_rename_columns_arrow_compat_test(lib, sym, ["my_level_0", "my_level_1"])
     received = lib.read(sym).data
@@ -442,7 +439,7 @@ def test_multi_index_explicit_rename_no_clash(in_memory_version_store, object_ty
     expected = (
         pd.DataFrame({"col": [0]}, index=expected_index)
         if object_type == "DataFrame"
-        else pd.Series([0], index=expected_index, name="")
+        else pd.Series([0], index=expected_index, name="col")
     )
     assert_pandas_equal(received, expected)
 
@@ -453,8 +450,6 @@ def test_multi_index_explicit_rename_clash(in_memory_version_store, object_type,
     lib = in_memory_version_store
     sym = "test_multi_index_explicit_rename_clash"
     index = pd.MultiIndex.from_arrays([[0], [1]])
-    # The Series must be explicitly named "col", otherwise it would get a synthetic "0" data column name instead,
-    # which would not clash with either method_arg below
     input = (
         pd.DataFrame({"col": [0]}, index=index)
         if object_type == "DataFrame"
@@ -471,7 +466,11 @@ def test_multi_index_incorrect_index_name_count(in_memory_version_store, object_
     lib = in_memory_version_store
     sym = "test_multi_index_incorrect_index_name_count"
     index = pd.MultiIndex.from_arrays([[0], [1]])
-    input = pd.DataFrame({"col": [0]}, index=index) if object_type == "DataFrame" else pd.Series([0], index=index)
+    input = (
+        pd.DataFrame({"col": [0]}, index=index)
+        if object_type == "DataFrame"
+        else pd.Series([0], index=index, name="col")
+    )
     lib.write(sym, input)
     with pytest.raises(UserInputException):
         lib.rename_columns_arrow_compat(sym, method_arg)
